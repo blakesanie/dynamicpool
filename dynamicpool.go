@@ -15,9 +15,9 @@ type Task interface {
 
 // evaluationState stores the last evaluation's metrics and ideal worker count.
 type evaluationState struct {
-	workerCount   float64 // ideal count, not just actual
-	direction     int
-	completedJobs int64
+	workerCount             float64 // ideal count, not just actual
+	increasing              bool
+	previouslyCompletedJobs int64
 }
 
 type worker struct {
@@ -51,32 +51,42 @@ type DynamicPool struct {
 	mu              sync.Mutex
 	completedJobs   int64
 	controlStopChan chan struct{}
-	lastEval        evaluationState
+	state           evaluationState
 }
 
 // New creates a dynamic worker pool using an externally provided job channel.
 func New(jobQueue chan Task, initialWorkers int, evaluationInterval time.Duration, scalingFactor float64) *DynamicPool {
+	if scalingFactor <= 1 {
+		panic("scalingFactor must be > 1 (ex. 1.2)")
+	}
+	if evaluationInterval == 0 {
+		panic("evaluationInterval must be > 0")
+	}
+	if initialWorkers < 1 {
+		initialWorkers = 1
+	}
 	p := &DynamicPool{
 		jobQueue:        jobQueue,
 		scalingFactor:   scalingFactor,
 		interval:        evaluationInterval,
 		controlStopChan: make(chan struct{}),
 		workers:         make([]*worker, 0, initialWorkers),
-		lastEval: evaluationState{
-			workerCount:   float64(initialWorkers),
-			direction:     1,
-			completedJobs: 0,
+		state: evaluationState{
+			workerCount:             float64(initialWorkers),
+			increasing:              true,
+			previouslyCompletedJobs: 0,
 		},
 	}
-
+	p.mu.Lock()
+	defer p.mu.Unlock()
 	for i := 0; i < initialWorkers; i++ {
 		p.spawnWorker()
 	}
-
 	go p.controlLoop()
 	return p
 }
 
+// requires outside lock
 func (p *DynamicPool) spawnWorker() {
 	w := &worker{
 		id:       len(p.workers), // ID is just current slice length
@@ -84,9 +94,7 @@ func (p *DynamicPool) spawnWorker() {
 		pool:     p,
 	}
 
-	p.mu.Lock()
 	p.workers = append(p.workers, w)
-	p.mu.Unlock()
 
 	p.wg.Add(1)
 	go w.run()
@@ -94,10 +102,8 @@ func (p *DynamicPool) spawnWorker() {
 	fmt.Printf("Spawned worker %d (total: %d)\n", w.id, len(p.workers))
 }
 
+// requires outside lock
 func (p *DynamicPool) removeWorker() {
-	p.mu.Lock()
-	defer p.mu.Unlock()
-
 	if len(p.workers) == 0 {
 		return
 	}
@@ -109,38 +115,45 @@ func (p *DynamicPool) removeWorker() {
 }
 
 func (p *DynamicPool) controlLoop() {
-	ticker := time.NewTicker(p.interval)
-	defer ticker.Stop()
 
+	var lastStart time.Time
 	for {
 		select {
 		case <-p.controlStopChan:
 			return
-		case <-ticker.C:
+		default:
+			sinceLast := time.Since(lastStart).Milliseconds()
+			fmt.Println("time since last control loop:", sinceLast)
+			lastStart = time.Now()
 			nowCompleted := atomic.LoadInt64(&p.completedJobs)
-			completedThisInterval := nowCompleted - p.lastEval.completedJobs
-
+			atomic.StoreInt64(&p.completedJobs, 0)
+			fmt.Println("jobs completed", nowCompleted)
 			// Decide direction based on change in throughput
-			newDirection := p.lastEval.direction
-			if completedThisInterval < p.lastEval.completedJobs {
-				newDirection *= -1
+			shouldIncrease := p.state.increasing
+			if nowCompleted < p.state.previouslyCompletedJobs {
+				shouldIncrease = !shouldIncrease
 			}
 
-			// Adjust float worker count
-			p.lastEval.workerCount += p.scalingFactor * float64(newDirection)
-			if p.lastEval.workerCount < 0 {
-				p.lastEval.workerCount = 0
+			if shouldIncrease {
+				p.state.workerCount *= p.scalingFactor
+			} else {
+				p.state.workerCount /= p.scalingFactor
+			}
+			if p.state.workerCount < 1 {
+				p.state.workerCount = 1
 			}
 
 			// Spawn/kill to match floored count
 			p.mu.Lock()
-			target := int(math.Floor(p.lastEval.workerCount))
+			target := int(math.Floor(p.state.workerCount))
 			current := len(p.workers)
 			if target > current {
+				fmt.Println("Raise workers to", target)
 				for i := 0; i < target-current; i++ {
 					p.spawnWorker()
 				}
 			} else if target < current {
+				fmt.Println("Reduce workers to", target)
 				for i := 0; i < current-target; i++ {
 					p.removeWorker()
 				}
@@ -148,8 +161,10 @@ func (p *DynamicPool) controlLoop() {
 			p.mu.Unlock()
 
 			// Save state
-			p.lastEval.direction = newDirection
-			p.lastEval.completedJobs = nowCompleted
+			p.state.increasing = shouldIncrease
+			p.state.previouslyCompletedJobs = nowCompleted
+			elapsed := time.Since(lastStart)
+			time.Sleep(p.interval - elapsed)
 		}
 	}
 }
@@ -157,13 +172,11 @@ func (p *DynamicPool) controlLoop() {
 // Close stops the control loop and all workers, then waits for them to finish.
 func (p *DynamicPool) WaitAndClose() {
 	close(p.controlStopChan)
-
 	p.mu.Lock()
 	for _, w := range p.workers {
 		close(w.killChan)
 	}
 	p.workers = nil
 	p.mu.Unlock()
-
 	p.wg.Wait()
 }
